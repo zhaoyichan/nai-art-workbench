@@ -57,6 +57,27 @@
         '8. 【硬性要求，违者视为失败】changes 必须包含"目标正文"里出现的每一个角色（在场角色名单见下方消息），绝对禁止返回空数组！每条格式 [{"name":"角色原名","tag":"英文 danbooru 短tag：发色/瞳色/发型/体型/服装等区分性外貌"}]。角色名用正文原名（如"李伟""狛枝凪斗"），tag 只写看得见的外貌，至少给 1-3 个最明显的特征词（如 "white messy hair, grey eyes, thin"）；哪怕正文没细写，也要按该角色常识补最典型外貌。不写性格/好感/羁绊/物品。漏掉任何一个在场角色都不允许。'
     ].join('\n');
 
+    /* ★ 注入模式专用指令（主人 2026-11-24 定）。
+       跟 DEFAULT_TAG_INSTRUCTION 完全不同：这条不是给文本 AI 规划 JSON，
+       而是注入酒馆系统提示，让【酒馆聊天 AI】边写正文边顺手写出画图标签。
+       数量不写死在模板里，由 showInjectPrompt() 按 settings.count 动态追加，
+       这样主人改「本楼层生图数量」后重新注入即可生效。
+       ★ 模板里含字面量 <naw_tag>/<role>：showInjectPrompt 用 scan=false 注入，
+         酒馆正则不会扫描这条系统提示，所以示例不会被隐藏正则吃掉。 */
+    var INJECT_INSTRUCTION = [
+        '你在进行小说式角色扮演：正常续写剧情正文，把角色的动作、神态、身体状态、场景与光线写清楚，不要写成提纲或列表。',
+        '同时，为了给插图程序提供画面，请在正文的【不同瞬间】后面，各紧跟一行画面标签块，格式严格如下：',
+        '<naw_tag size="portrait">english danbooru tags</naw_tag>',
+        '标签规则：',
+        '1. size 只能是 portrait（竖图）或 landscape（横图），拿不准写 portrait。',
+        '2. 标签内容只能是英文 danbooru 短标签：人物外貌、服装、动作、表情、镜头、场景、光线，用英文逗号分隔；不要写质量词、负面词、中文、剧情说明、JSON，更不要写 <naw_image> 标签。',
+        '3. 每段画面挑正文里一个明显不同的瞬间，不要给同一场景写多段重复的标签。',
+        '4. 出场的每个角色请各写一行外貌档案，格式严格如下（角色名用正文原名，后面写英文外貌短标签）：',
+        '<role>角色名：english appearance tags</role>',
+        '5. 上述标签是给画图程序读的标记，不是剧情内容：不要在正文里解释它、也不要在对话里提到它。',
+        '6. 除剧情正文和这些标签块外，不要输出其它内容。'
+    ].join('\n');
+
     // NAI 质量/负面词表：按模型名「后缀包含」匹配（第三方模型名常带前缀，
     //   如 "[0.05/次][出图nai1] nai-diffusion-4-5-full"，精确相等会查不到）。
     //   这里只存「质量词」，不存模型列表 —— 模型一律从接口拉取/用户手填。
@@ -125,7 +146,12 @@
         charScope: 'global',                     // 新角色默认范围：global|char|chat
         galleryMeta: [],                         // 图库元数据（含 position/seed/prompt）
         fabPos: null,                            // 悬浮球自定义位置 {x,y}（可拖动，持久化）
-        tagInstruction: DEFAULT_TAG_INSTRUCTION
+        // ★ tagInstruction 现在 = 注入指令（写正文+顺手写 tag）。genTags 走写死的 DEFAULT_TAG_INSTRUCTION，不受影响
+        tagInstruction: INJECT_INSTRUCTION,
+        // ★ 注入模式（主人 2026-11-24 定）：触发方式 A/B + 正文标签过滤
+        injectTrigger: 'button',                 // button=只出按钮手动点(A，默认) | auto=回复后自动全出(B)
+        tagFilterMode: 'off',                    // off=不过滤 | keep=只保留 | exclude=只排除
+        tagFilterNames: []                       // 用户勾选的标签名（小写、不含尖括号）
     };
 
     /* 请求日志：内存 + 落盘到酒馆 settings（主人要：日志要给看/给复制，刷新不丢） */
@@ -253,6 +279,16 @@
                 settings.size = (settings.size === 'landscape' || settings.size === 'portrait') ? settings.size : 'portrait';
                 settings.characters = (settings.characters || []).filter(function (c) { return !/\.(png|jpg|jpeg|webp)$/i.test(c.name || ''); });
                 settings.__migrated = 'v22';
+                saveSettings();
+            }
+            // ★ v23 迁移（2026-11-24）：把注入指令换成「写正文+顺手写 tag」，补新配置项。
+            //   只补缺失项，不覆盖主人手动改过的指令内容以外的任何东西。
+            if (saved.__migrated !== 'v23') {
+                settings.tagInstruction = INJECT_INSTRUCTION;   // Q4-A：直接换成新的写正文+tag 指令
+                if (!settings.injectTrigger) settings.injectTrigger = 'button';
+                if (!settings.tagFilterMode) settings.tagFilterMode = 'off';
+                if (!Array.isArray(settings.tagFilterNames)) settings.tagFilterNames = [];
+                settings.__migrated = 'v23';
                 saveSettings();
             }
             // ★ scope 迁移：老角色没有 scope 的一律补成 global（保持原有"到处可见"行为），不覆盖已设过的
@@ -976,6 +1012,10 @@
     var NAW_PLAN_HIDE_LITERAL = '/<naw_plan>[\\s\\S]+?<\\/naw_plan>/gi';
     // ★ tag 展示标签：给人看的画面 tag，显示路径渲染成可见角标，提示词路径移除（下一轮不喂 AI）
     var NAW_TAGVIEW_LITERAL = '/<naw_tagview>([\\s\\S]*?)<\\/naw_tagview>/gi';
+    // ★ 注入模式：AI 顺手写在正文里的 <naw_tag>/<role> 是【画图专用】，
+    //   下一轮绝不能喂给文本 AI。注册提示词路径隐藏正则（主人 2026-11-24 硬规矩）。
+    var NAW_INJECT_TAG_LITERAL = '/<naw_tag\\b[^>]*>[\\s\\S]*?<\\/naw_tag>/gi';
+    var NAW_ROLE_LITERAL = '/<role\\b[^>]*>[\\s\\S]*?<\\/role>/gi';
     function ensureImageTagRegex() {
         var ctx = getCtx();
         if (!ctx || !ctx.extensionSettings) return false;
@@ -1002,6 +1042,20 @@
               replaceString: '', placement: [1, 2, 3], disabled: false,
               markdownOnly: true, promptOnly: false, runOnEdit: true, substituteRegex: 0, trimStrings: [], minDepth: null, maxDepth: null },
             { id: 'naw-tagview-hide', scriptName: '生图工作台·画面tag角标(提示词隐藏)', findRegex: NAW_TAGVIEW_LITERAL,
+              replaceString: '', placement: [1, 2, 3], disabled: false,
+              markdownOnly: false, promptOnly: true, runOnEdit: true, substituteRegex: 0, trimStrings: [], minDepth: null, maxDepth: null },
+            // ★ 注入标签：显示路径抹掉（英文串不外露，按钮由 <naw_image> 占位渲染）；提示词路径也抹掉（下一轮不喂 AI）
+            { id: 'naw-inject-tag-view', scriptName: '生图工作台·注入tag不显示(显示)', findRegex: NAW_INJECT_TAG_LITERAL,
+              replaceString: '', placement: [1, 2, 3], disabled: false,
+              markdownOnly: true, promptOnly: false, runOnEdit: true, substituteRegex: 0, trimStrings: [], minDepth: null, maxDepth: null },
+            { id: 'naw-inject-tag-hide', scriptName: '生图工作台·注入tag不喂AI(提示词)', findRegex: NAW_INJECT_TAG_LITERAL,
+              replaceString: '', placement: [1, 2, 3], disabled: false,
+              markdownOnly: false, promptOnly: true, runOnEdit: true, substituteRegex: 0, trimStrings: [], minDepth: null, maxDepth: null },
+            // ★ role 外貌标签：同样只画图用，显示+提示词两条路径都抹掉
+            { id: 'naw-role-view', scriptName: '生图工作台·role外貌不显示(显示)', findRegex: NAW_ROLE_LITERAL,
+              replaceString: '', placement: [1, 2, 3], disabled: false,
+              markdownOnly: true, promptOnly: false, runOnEdit: true, substituteRegex: 0, trimStrings: [], minDepth: null, maxDepth: null },
+            { id: 'naw-role-hide', scriptName: '生图工作台·role外貌不喂AI(提示词)', findRegex: NAW_ROLE_LITERAL,
               replaceString: '', placement: [1, 2, 3], disabled: false,
               markdownOnly: false, promptOnly: true, runOnEdit: true, substituteRegex: 0, trimStrings: [], minDepth: null, maxDepth: null }
         ].forEach(function (script) {
@@ -1225,6 +1279,33 @@
     }
     function findTagByImageId(id) { return findImageMeta(id).tag; }
 
+    /* ★ v3.22：重新生成前，把当前旧图另存成一个历史版本。
+       旧图换一个历史 key 存进 IndexedDB + 图库（scene 同 tag），
+       正文仍用原 id 显示最新一张 → 翻页能翻到真正不同的旧版本。
+       time 用「现在 - 1000ms」保证排在最新版本之前（更早）。 */
+    function archiveOldImage(id, tag, size, base) {
+        return new Promise(function (resolve) {
+            try {
+                getImage(id, function (oldUrl) {
+                    if (!oldUrl) return resolve();   // 占位还没出过图，无需存档
+                    var histId = id + '_h' + Date.now();
+                    putImage(histId, oldUrl, function (ok) {
+                        if (ok) {
+                            (settings.galleryMeta || []).unshift({
+                                id: histId, role: galleryRole(), prompt: fullPositive(tag), scene: tag,
+                                model: (base && base.model) || settings.imgModel, seed: (base && base.seed) || null,
+                                time: Date.now() - 1000, size: size, msgFloor: base && base.msgFloor,
+                                position: base && base.position, archived: true
+                            });
+                            saveSettings();
+                        }
+                        resolve();
+                    });
+                });
+            } catch (e) { resolve(); }
+        });
+    }
+
     // ★ 按「这张已存 tag + 当前画师串」直出生图 AI（绝不经过文本 AI）
     //   replaceId 为空 = 另出一张新图（保留原图）；给了 id = 替换这张（同 id 覆盖写回）。
     async function generateForImage(id, btn, replaceId) {
@@ -1239,6 +1320,9 @@
         progOpen(replaceId ? '正文图·重新生成' : '正文图·另出一张');
         try {
             progUpdate('正在按已存 tag + 画师串生成…', 40, '生图AI·直出');
+            // ★ v3.22：重新生成前先把当前旧图存档，供大图「上一张/下一张」翻页。
+            //   仅在「重新生成」（给了 replaceId）时存档；「另出一张」不动旧图。
+            if (replaceId) await archiveOldImage(replaceId, tag, size, meta.meta || {});
             var r = await callNaiImage(tag, size);          // ★ 直接生图，不碰文本 AI
             putImage(newId, r.dataUrl, function () {});
             // 写图库元数据（新 id 用原图的 tag/size/position/角色）
@@ -1298,10 +1382,39 @@
         [200, 700, 1600].forEach(function (ms) { setTimeout(hydrateImageSlots, ms); });
     }
 
+    /* ★ v3.22（2026-11-24）：同一 tag 的重新生成版本串成一组，供大图翻页。
+       依据：图库每条 meta 记了 scene（=该图的 tag）和 time。
+       · 按 scene 完全相同（去首尾空格）分组 → 就是「这一个 tag 重新生成的图」
+       · 组内按 time 倒序（最新在前，主人选定的顺序）
+       · 返回 id 数组；只有一张时数组长度=1，翻页按钮自动隐藏
+       不删任何图、不改索引、不影响正文。 */
+    function siblingVersionIds(id) {
+        var all = (settings.galleryMeta || []).slice();
+        var self = all.filter(function (x) { return x && x.id === id; })[0];
+        if (!self) return [id];
+        var key = String(self.scene || self.tag || '').trim();
+        if (!key) return [id];
+        // 同一 id 可能在图库里有多条（历史遗留重复写），按 id 去重、只留 time 最大那条
+        var byId = {};
+        all.forEach(function (x) {
+            if (!x || !x.id) return;
+            if (String(x.scene || x.tag || '').trim() !== key) return;
+            var prev = byId[x.id];
+            if (!prev || (x.time || 0) > (prev.time || 0)) byId[x.id] = x;
+        });
+        var same = Object.keys(byId).map(function (k) { return byId[k]; });
+        if (!same.length) return [id];
+        same.sort(function (a, b) { return (b.time || 0) - (a.time || 0); });   // 最新在前
+        return same.map(function (x) { return x.id; });
+    }
+
     // ★ 大图查看器：点正文图打开，带 生图/重新生成/下载/修改tag/查看tag 五个按钮
-    function openImageViewer(id) {
+    function openImageViewer(id, viewId) {
         var meta = findImageMeta(id);
-        getImage(id, function (dataUrl) {
+        var versions = siblingVersionIds(id);          // 同 tag 版本，最新在前
+        var shown = viewId && versions.indexOf(viewId) >= 0 ? viewId : id;
+        var vi = Math.max(0, versions.indexOf(shown));
+        getImage(shown, function (dataUrl) {
             var wrap = byId('naw-viewer');
             if (!wrap) {
                 wrap = el('div');
@@ -1310,12 +1423,22 @@
                 wrap.addEventListener('click', function (e) { if (e.target === wrap) closeImageViewer(); });
             }
             window.__nawViewerId = id;
+            window.__nawViewerShown = shown;
             var imgHtml = dataUrl
                 ? '<img class="naw-viewer-img" src="' + esc(dataUrl) + '" alt="生图大图">'
                 : '<div class="naw-viewer-noimg">这张还没出图（tag 已存），点「重新生成」按已存 tag 出图</div>';
+            // ★ v3.22：同 tag 多版本时，图片上方加「‹ 第 N/M 张 ›」翻页条
+            var navHtml = versions.length > 1
+                ? '<div class="naw-viewer-nav">' +
+                    '<button class="naw-viewer-navbtn" id="naw-v-prev" title="上一张">‹ 上一张</button>' +
+                    '<span class="naw-viewer-count">第 ' + (vi + 1) + ' / ' + versions.length + ' 张</span>' +
+                    '<button class="naw-viewer-navbtn" id="naw-v-next" title="下一张">下一张 ›</button>' +
+                  '</div>'
+                : '';
             wrap.innerHTML =
               '<div class="naw-viewer-box">' +
                 '<button class="naw-viewer-close" id="naw-v-close" title="关闭">×</button>' +
+                navHtml +
                 imgHtml +
                 '<div class="naw-viewer-bar">' +
                   '<button class="naw-btn naw-btn-sm" data-naw-act="gen" data-naw-regen="' + esc(id) + '">＋ 生图</button>' +
@@ -1328,9 +1451,17 @@
               '</div>';
             wrap.classList.add('on');
             byId('naw-v-close').onclick = closeImageViewer;
+            // ★ 翻页：循环回绕（末张下一张回第一张，首张上一张到末张）
+            var pv = byId('naw-v-prev'), nx = byId('naw-v-next');
+            if (pv) pv.onclick = function () {
+                openImageViewer(id, versions[(vi - 1 + versions.length) % versions.length]);
+            };
+            if (nx) nx.onclick = function () {
+                openImageViewer(id, versions[(vi + 1) % versions.length]);
+            };
             var dl = byId('naw-v-dl');
             if (dl) dl.onclick = function () {
-                var a = document.createElement('a'); a.href = dataUrl; a.download = id + '.png'; a.click();
+                var a = document.createElement('a'); a.href = dataUrl; a.download = shown + '.png'; a.click();
             };
             byId('naw-v-viewtag').onclick = function () {
                 var t = byId('naw-v-tag');
@@ -1361,6 +1492,7 @@
         var w = byId('naw-viewer');
         if (w) { w.classList.remove('on'); w.innerHTML = ''; }
         window.__nawViewerId = '';
+        window.__nawViewerShown = '';
     }
     function bindInlineRegen() {
         if (window.__nawRegenBound) return;
@@ -1412,6 +1544,82 @@
         // 3) 图片锚点重新出现后水合（幂等，靠 data-naw-done 防重复）
         //    ★ 多次重试：酒馆重绘有快有慢，锚点晚出现也能等到
         [200, 600, 1400, 3000].forEach(function (ms) { setTimeout(hydrateImageSlots, ms); });
+    }
+
+    /* ═══════════ 注入模式：抓正文 tag → 直出生图（主人 2026-11-24 定）═══════════
+       ★ 硬规矩：注入模式下【绝不调用文本 AI】。AI 写正文时顺手写出
+         <naw_tag size="portrait">英文tag</naw_tag> 与 <role>名字：外貌</role>。
+         本函数扫描刚生成的正文，做三件事：
+           ① 每个 <naw_tag> → 稳定 id，写 <naw_plan>（隐藏数据，存 tag/size/line/id），
+              并把正文里的 <naw_tag>…</naw_tag> 原位替换成 <naw_image>id</naw_image>。
+              于是显示层现有逻辑自动把它渲染成「＋生成这张图」按钮（无图）或图片（有图），
+              位置就在原 tag 那里，且英文串不外露 —— 正中主人要求。
+           ② <role> 外貌抓进角色库，然后从正文删掉（不外露英文串）。
+           ③ 按 settings.injectTrigger 决定：button=只出按钮；auto=逐张直出生图 AI。
+         ★ 幂等：跑过一次后正文里已无 <naw_tag>，再跑无副作用，不会重复出图。
+       ★ 下一轮不喂 AI：naw_tag/role 在提示词路径由正则抹掉（见 ensureImageTagRegex）；
+         naw_image/naw_plan 本来就有提示词隐藏正则。 */
+    async function captureInjectTags(floor) {
+        var ctx = getCtx(), ch = chatArray(), msg = ch[floor];
+        if (!msg) return 0;
+        var raw = messageText(msg);
+        if (raw.indexOf('<naw_tag') < 0) return 0;   // 没有 tag → 啥也不做（幂等）
+        var lines = raw.split(/\r\n|\n|\r/);
+        var plans = [], m;
+        var tagRe = /<naw_tag\b([^>]*)>([\s\S]*?)<\/naw_tag>/gi;
+        while ((m = tagRe.exec(raw)) !== null) {
+            var attr = m[1] || '';
+            var tag = String(m[2] || '').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+            if (!tag) continue;
+            var size = /\blandscape\b/i.test(attr) ? 'landscape' : 'portrait';
+            var ln = lines.length - 1;
+            for (var j = 0; j < lines.length; j++) { if (lines[j].indexOf(m[0]) >= 0) { ln = j; break; } }
+            plans.push({ tag: tag, size: size, line: ln, raw: m[0] });
+        }
+        if (!plans.length) return 0;
+
+        // ② role 外貌进角色库（抓完就从正文删，避免英文串外露）
+        var roleRe = /<role\b[^>]*>([\s\S]*?)<\/role>/gi, rm, roleGot = 0;
+        while ((rm = roleRe.exec(raw)) !== null) {
+            var inner = String(rm[1] || '').trim();
+            var cm = /^([^：:]{1,30})[：:]\s*([\s\S]+)$/.exec(inner);
+            if (!cm) continue;
+            var name = cm[1].trim(), rtag = cm[2].trim().replace(/\s+/g, ' ');
+            if (!name || !rtag) continue;
+            var c = findChar(name);
+            if (c) { c.tag = rtag; c.fields = parseFields(rtag); c.source = 'ai'; }
+            else upsertCharacter(name, rtag, 'ai', null, true);
+            roleGot++;
+        }
+        if (roleGot) { saveSettings(); if (typeof renderRoles === 'function') renderRoles(); }
+
+        // ① 生成稳定 id + 原位替换 <naw_tag> → <naw_image>，并删掉 <role>
+        var stamp = Date.now();
+        plans.forEach(function (p, i) { p.id = 'naw_' + stamp + '_' + i; });
+        var idx = 0;
+        var newText = raw
+            .replace(/<naw_tag\b[^>]*>([\s\S]*?)<\/naw_tag>/gi, function () {
+                var p = plans[idx++];
+                return p ? '<naw_image>' + p.id + '</naw_image>' : '';
+            })
+            .replace(/<role\b[^>]*>[\s\S]*?<\/role>/gi, '');
+        var block = plans.map(function (p) {
+            return '<naw_plan>' + JSON.stringify({
+                position: 'P' + (p.line + 1), line: p.line, tag: p.tag, size: p.size, id: p.id
+            }) + '</naw_plan>';
+        }).join('\n');
+        newText = newText.replace(/\s+$/, '') + '\n\n' + block;
+        setMessageText(msg, newText);
+        try { if (ctx && typeof ctx.saveChat === 'function') await ctx.saveChat(); } catch (e) {}
+        await refreshFloor(floor);
+
+        // ③ 触发方式：button=只出按钮；auto=逐张直出生图 AI（不碰文本 AI）
+        if (settings.injectTrigger === 'auto') {
+            for (var k = 0; k < plans.length; k++) {
+                await generateForImage(plans[k].id, null, plans[k].id);
+            }
+        }
+        return plans.length;
     }
 
     /* ═══════════ 出图主流程 ═══════════ */
@@ -1758,7 +1966,11 @@
         overlay.onclick = function (e) { if (e.target === overlay) overlay.classList.remove('on'); };
         byId('naw-floor-prev').onclick = function () { if (curFloor > 0) { curFloor--; renderFloor(); } };
         byId('naw-floor-next').onclick = function () { if (curFloor < lastAiIndex()) { curFloor++; renderFloor(); } };
-        byId('naw-mini-gen').onclick = function () { runGenerate({ floor: curFloor }); };
+        byId('naw-mini-gen').onclick = function () {
+            // ★ 注入模式：抓正文 tag 直出（button 触发方式下点这里也按已抓的 tag 出图）
+            if (settings.mode === 'inject') { captureInjectTags(curFloor); return; }
+            runGenerate({ floor: curFloor });
+        };
 
         document.querySelectorAll('#naw-root .naw-mtab').forEach(function (t) {
             t.onclick = function () {
@@ -1907,6 +2119,113 @@
         toast('已保存');
     }
 
+    /* ★ 注入模式的出图触发方式 A/B（主人 2026-11-24 定，默认 A 按钮） */
+    function renderInjectTrigger() {
+        var w = byId('naw-inject-trigger');
+        if (!w) return;
+        if (settings.mode !== 'inject') { w.innerHTML = ''; w.style.display = 'none'; return; }
+        w.style.display = '';
+        w.innerHTML = '<div class="naw-subhead" style="margin-top:12px">注入后怎么出图' +
+            help('A=每个 tag 处只显示「＋生成这张图」按钮，你想画哪张点哪张（省额度，默认）。B=AI 回复后自动把所有 tag 都生出图。') + '</div>' +
+            '<div class="naw-send-modes">' +
+              '<div class="naw-send-opt' + (settings.injectTrigger === 'button' ? ' on' : '') + '" data-trig="button">' +
+                '<span class="naw-so-radio"></span><span class="naw-so-txt"><b>A · 只出按钮（默认）</b>' +
+                '<div class="naw-mini-desc">每个 tag 处一个按钮，点哪张画哪张</div></span></div>' +
+              '<div class="naw-send-opt' + (settings.injectTrigger === 'auto' ? ' on' : '') + '" data-trig="auto">' +
+                '<span class="naw-so-radio"></span><span class="naw-so-txt"><b>B · 回复后自动全出</b>' +
+                '<div class="naw-mini-desc">AI 写完正文就把所有 tag 连续出图</div></span></div>' +
+            '</div>';
+        w.querySelectorAll('.naw-send-opt').forEach(function (o) {
+            o.onclick = function () {
+                settings.injectTrigger = o.getAttribute('data-trig'); saveSettings();
+                w.querySelectorAll('.naw-send-opt').forEach(function (x) { x.classList.remove('on'); });
+                o.classList.add('on');
+            };
+        });
+    }
+
+    /* ── 正文尖括号标签过滤：检测 + 勾选清单 + 过滤函数（立伟插件同款） ── */
+    // 扫描当前聊天所有楼层正文，抓出 <xxx> 成对标签名（含中文标签），按占用字符数排序
+    function detectAngleTagNames() {
+        var ch = chatArray(), map = {};
+        var VOID = { br:1,hr:1,img:1,input:1,meta:1,link:1,source:1,wbr:1,area:1,base:1,col:1,embed:1,param:1,track:1 };
+        ch.forEach(function (msg) {
+            var src = messageText(msg) || '';
+            if (src.indexOf('<') < 0) return;
+            var re = /<\s*\/?\s*([^\s<>/]+)(?:\s[^<>]*?)?(\/?)\s*>/g, m, stack = [], all = [];
+            while ((m = re.exec(src)) !== null) {
+                var name = String(m[1] || '').toLowerCase();
+                if (!name || VOID[name] || m[2] === '/') continue;
+                if (/^<\s*\//.test(m[0])) {
+                    for (var i = stack.length - 1; i >= 0; i--) {
+                        if (stack[i].name === name) { var op = stack[i]; stack.length = i; all.push({ name: name, len: m.index + m[0].length - op.start }); break; }
+                    }
+                } else stack.push({ name: name, start: m.index });
+            }
+            all.forEach(function (b) { map[b.name] = (map[b.name] || 0) + b.len; });
+        });
+        return Object.keys(map).sort(function (a, b) { return map[b] - map[a]; });
+    }
+    function renderTagFilterNames() {
+        var box = byId('naw-tfilter-box');
+        if (!box) return;
+        if (settings.tagFilterMode === 'off') { box.innerHTML = '<div class="naw-empty">不过滤：正文原样送给 AI</div>'; return; }
+        var names = detectAngleTagNames();
+        var picked = Array.isArray(settings.tagFilterNames) ? settings.tagFilterNames : [];
+        var html = '<div class="naw-mini-desc" style="margin-bottom:6px">当前聊天检测到的标签（勾选要' +
+            (settings.tagFilterMode === 'keep' ? '保留' : '排除') + '的）：</div>';
+        if (!names.length) html += '<div class="naw-empty">没检测到成对尖括号标签</div>';
+        names.forEach(function (n) {
+            html += '<label class="naw-tf-item"><input type="checkbox" data-tag="' + esc(n) + '"' +
+                (picked.indexOf(n) >= 0 ? ' checked' : '') + '> <span>' + esc(n) + '</span></label>';
+        });
+        html += '<div style="margin-top:8px"><button class="naw-btn naw-btn-sm" id="naw-tfilter-rescan">重新检测</button></div>';
+        box.innerHTML = html;
+        box.querySelectorAll('input[data-tag]').forEach(function (cb) {
+            cb.onchange = function () {
+                var t = cb.getAttribute('data-tag');
+                var arr = Array.isArray(settings.tagFilterNames) ? settings.tagFilterNames.slice() : [];
+                if (cb.checked) { if (arr.indexOf(t) < 0) arr.push(t); }
+                else arr = arr.filter(function (x) { return x !== t; });
+                settings.tagFilterNames = arr; saveSettings();
+                syncTagFilterRegex();
+            };
+        });
+        var rs = byId('naw-tfilter-rescan');
+        if (rs) rs.onclick = function () { renderTagFilterNames(); toast('已重新检测正文标签'); };
+    }
+    // ★ 同步「正文标签过滤」到酒馆正则：promptOnly=true → 只影响送进 AI 的文本，绝不改显示。
+    //   exclude：隐藏勾选的标签块；keep：隐藏【未勾选】的标签块（只让勾选的内容进 AI）。
+    function syncTagFilterRegex() {
+        var ctx = getCtx();
+        if (!ctx || !ctx.extensionSettings) return;
+        var es = ctx.extensionSettings;
+        if (!Array.isArray(es.regex)) es.regex = [];
+        // 先清掉本功能上一轮注册的全部规则（固定前缀），再按当前设置重建
+        es.regex = es.regex.filter(function (r) { return !(r && typeof r.id === 'string' && r.id.indexOf('naw-uf-') === 0); });
+        var mode = settings.tagFilterMode || 'off';
+        if (mode !== 'off') {
+            var picked = (Array.isArray(settings.tagFilterNames) ? settings.tagFilterNames : []).map(function (x) { return String(x).toLowerCase(); });
+            var targets;
+            if (mode === 'keep') {
+                targets = detectAngleTagNames().filter(function (n) { return picked.indexOf(n) < 0; });
+            } else {
+                targets = picked.slice();
+            }
+            targets.forEach(function (name, i) {
+                var safe = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                es.regex.push({
+                    id: 'naw-uf-' + i, scriptName: '生图工作台·正文标签过滤(' + mode + ')·' + name,
+                    findRegex: '/<' + safe + '\\b[^>]*>[\\s\\S]*?<\\/' + safe + '>/gi',
+                    replaceString: '', placement: [1, 2, 3], disabled: false,
+                    markdownOnly: false, promptOnly: true, runOnEdit: true, substituteRegex: 0,
+                    trimStrings: [], minDepth: null, maxDepth: null
+                });
+            });
+        }
+        try { if (typeof ctx.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced(); } catch (e) {}
+    }
+
     /* ── 提示词 tab ── */
     function renderPrompt() {
         var p = byId('naw-panel-prompt');
@@ -1919,8 +2238,18 @@
           '<div class="naw-artist-lib"><div class="naw-al-head">◆ 画师串库<span class="naw-sp"></span>' +
             '<button class="naw-btn naw-btn-sm" id="naw-artist-save">保存当前串</button></div>' +
             '<div class="naw-artist-chips" id="naw-artist-chips"></div></div>' +
-          '<label>正文转标签指令' + help('这段发给文本 AI，让它读正文产出 <liwe>画面 tag</liwe> 和 <role>角色外貌 tag</role>。可自由改。') + '</label>' +
-          '<textarea id="naw-instr" rows="8">' + esc(settings.tagInstruction) + '</textarea>' +
+          '<label>注入指令（写正文 + 顺手写 tag）' + help('★ 注入模式专用：这段注入酒馆系统提示，让 AI 边正常写小说、边在画面处写出 <naw_tag>英文 tag</naw_tag> 和 <role>角色：外貌</role>。插件直接抓这些 tag 出图，不再调文本 AI。生几张按设置里的「本楼层生图数量」。') + '</label>' +
+          '<textarea id="naw-instr" rows="10">' + esc(settings.tagInstruction) + '</textarea>' +
+          '<div style="margin:6px 0"><button class="naw-btn naw-btn-sm" id="naw-instr-reset">恢复默认注入指令</button>' +
+            help('把上面指令恢复成插件默认的「写正文+顺手写 tag」版本，不碰其它设置。') + '</div>' +
+          '<div class="naw-subhead" style="margin-top:12px">正文尖括号标签过滤' +
+            help('全局生效、不改酒馆显示：只决定【送进 AI 的正文】里保不保留某些尖括号标签块。自动检测当前聊天的标签；选「只保留」=仅保留勾选标签的内容；选「只排除」=删掉勾选标签块；「不过滤」=原样送。立伟插件同款逻辑。') + '</div>' +
+          '<div class="naw-send-modes" id="naw-tfilter-modes">' +
+            '<div class="naw-send-opt' + (settings.tagFilterMode === 'off' ? ' on' : '') + '" data-tf="off"><span class="naw-so-radio"></span><span class="naw-so-txt"><b>不过滤</b><div class="naw-mini-desc">正文原样送给 AI</div></span></div>' +
+            '<div class="naw-send-opt' + (settings.tagFilterMode === 'keep' ? ' on' : '') + '" data-tf="keep"><span class="naw-so-radio"></span><span class="naw-so-txt"><b>只保留</b><div class="naw-mini-desc">正文里只留勾选标签的内容</div></span></div>' +
+            '<div class="naw-send-opt' + (settings.tagFilterMode === 'exclude' ? ' on' : '') + '" data-tf="exclude"><span class="naw-so-radio"></span><span class="naw-so-txt"><b>只排除</b><div class="naw-mini-desc">正文里删掉勾选的标签块</div></span></div>' +
+          '</div>' +
+          '<div id="naw-tfilter-box" style="margin-top:8px"></div>' +
           '<details class="naw-fold"><summary>官方质量词 / 负面词（点开查看）</summary>' +
             '<label>质量词</label><div class="naw-prompt-box">' + esc(settings.quality) + '</div>' +
             '<label>负面词' + help('负面词按你所选接口的实际情况填写；NAI 走后端方案配置。') + '</label>' +
@@ -1940,14 +2269,36 @@
         p.innerHTML = '';
         p.appendChild(card);
 
-        byId('naw-instr').onchange = function () { settings.tagInstruction = this.value; saveSettings(); toast('指令已保存'); };
+        byId('naw-instr').onchange = function () {
+            settings.tagInstruction = this.value; saveSettings(); toast('指令已保存');
+            if (settings.mode === 'inject') showInjectPrompt();   // 改了注入指令 → 立即重新注入生效
+        };
+        byId('naw-instr-reset').onclick = function () {
+            settings.tagInstruction = INJECT_INSTRUCTION; saveSettings();
+            var ta = byId('naw-instr'); if (ta) ta.value = INJECT_INSTRUCTION;
+            if (settings.mode === 'inject') showInjectPrompt();
+            toast('已恢复默认注入指令');
+        };
         byId('naw-negative').onchange = function () { settings.negative = this.value; saveSettings(); };
         byId('naw-size').onchange = function () { settings.size = this.value; saveSettings(); };
         byId('naw-count').onchange = function () {
             settings.count = parseInt(this.value, 10); saveSettings();
             var c2 = byId('naw-setting-count'); if (c2) c2.value = this.value;
+            if (settings.mode === 'inject') showInjectPrompt();   // 改数量 → 重新注入（数量写进指令）
         };
         byId('naw-prompt-gen').onclick = function () { runGenerateDirect(); };
+        // ★ 正文尖括号标签过滤：三单选 + 自动检测清单 + 重新检测
+        var tfBox = byId('naw-tfilter-modes');
+        tfBox.querySelectorAll('.naw-send-opt').forEach(function (o) {
+            o.onclick = function () {
+                settings.tagFilterMode = o.getAttribute('data-tf'); saveSettings();
+                tfBox.querySelectorAll('.naw-send-opt').forEach(function (x) { x.classList.remove('on'); });
+                o.classList.add('on');
+                syncTagFilterRegex();
+                renderTagFilterNames();
+            };
+        });
+        renderTagFilterNames();
         // ★ 画师串框：直接打字/粘贴，改完自动保存（不再依赖 prompt 弹窗）
         var artistBox = byId('naw-artist-box');
         if (artistBox) {
@@ -1972,14 +2323,31 @@
             return;
         }
         settings.artists.forEach(function (a, i) {
+            var wrap = el('span', 'naw-artist-chip-wrap');
+            wrap.style.cssText = 'display:inline-flex;align-items:center;gap:2px';
             var b = el('button', 'naw-artist-chip' + (a.v === settings.artistCur ? ' on' : ''), esc(a.n));
             b.onclick = function () {
                 settings.artistCur = a.v; saveSettings();
                 var ab = byId('naw-artist-box'); if (ab) ab.value = a.v;
                 renderArtistChips(); renderMiniArtists(); toast('已选用：' + a.n);
             };
-            box.appendChild(b);
+            var del = el('button', 'naw-artist-del', '×');
+            del.title = '删除这条画师串：' + a.n;
+            del.style.cssText = 'border:0;background:transparent;color:var(--naw-ink3,#888);cursor:pointer;font-size:14px;line-height:1;padding:0 2px';
+            del.onclick = function () { deleteArtistAt(i); };
+            wrap.appendChild(b); wrap.appendChild(del);
+            box.appendChild(wrap);
         });
+    }
+    // ★ 删除画师串库某一条（提示词页 + 悬浮球面板两处共用）
+    function deleteArtistAt(i) {
+        var a = (settings.artists || [])[i];
+        if (!a) return;
+        if (!confirm('确定删除画师串「' + a.n + '」？删了就找不回来了。')) return;
+        settings.artists.splice(i, 1);
+        if (settings.artistCur === a.v) settings.artistCur = '';
+        saveSettings(); renderArtistChips(); renderMiniArtists();
+        toast('已删除画师串：' + a.n);
     }
     // ★ v3.16 悬浮球画师串快捷切换：只选用已存串；切后同步提示词页输入框+工作台标签高亮
     function renderMiniArtists() {
@@ -1993,7 +2361,9 @@
         var active = list.filter(function (a) { return a.v === settings.artistCur; })[0];
         if (cur) cur.textContent = active ? ('当前：' + active.n) : '当前：手动输入';
         box.innerHTML = '';
-        list.forEach(function (a) {
+        list.forEach(function (a, i) {
+            var wrap = el('span', 'naw-artist-chip-wrap');
+            wrap.style.cssText = 'display:inline-flex;align-items:center;gap:2px';
             var b = el('button', 'naw-artist-chip' + (a.v === settings.artistCur ? ' on' : ''), esc(a.n));
             b.title = a.v;
             b.onclick = function () {
@@ -2003,7 +2373,12 @@
                 renderMiniArtists();     // 刷新悬浮球自己的高亮
                 toast('已选用画师串：' + a.n);
             };
-            box.appendChild(b);
+            var del = el('button', 'naw-artist-del', '×');
+            del.title = '删除画师串：' + a.n;
+            del.style.cssText = 'border:0;background:transparent;color:var(--naw-ink3,#888);cursor:pointer;font-size:14px;line-height:1;padding:0 2px';
+            del.onclick = function () { deleteArtistAt(i); };
+            wrap.appendChild(b); wrap.appendChild(del);
+            box.appendChild(wrap);
         });
     }
     // 直接用提示词出图（不读正文）
@@ -2309,6 +2684,7 @@
         cntWrap.querySelector('select').onchange = function () {
             settings.count = parseInt(this.value, 10); saveSettings();
             var c2 = byId('naw-count'); if (c2) c2.value = this.value;
+            if (settings.mode === 'inject') showInjectPrompt();   // 改数量 → 重新注入
         };
 
         var det = el('details', 'naw-fold');
@@ -2320,14 +2696,14 @@
         renderBreakOpts();
 
         // ② 出图模式
-        var modeHead = el('div', 'naw-subhead', '出图模式' + help('自动=AI 回复后自动读正文出图；注入=工作台直接把 <role>/<liwe> 规则注入酒馆系统提示，让 AI 出正文时写出标签（不用你自己贴）；手动=点悬浮球才出图。切换真实生效。'));
+        var modeHead = el('div', 'naw-subhead', '出图模式' + help('自动=AI 回复后调文本 AI 读正文规划再出图；注入=把「写正文+顺手写 tag」规则注入酒馆，AI 边写正文边写 tag，插件直接抓 tag 出图（不调文本 AI）；手动=点悬浮球才出图。切换真实生效。'));
         modeHead.id = 'naw-sec-mode-head';
         p.appendChild(modeHead);
         var c2 = el('div', 'naw-card');
         c2.id = 'naw-sec-mode';
         var modeBox = el('div', 'naw-mode-opts');
-        [['auto', '① 自动', 'AI 回复出来 → 读正文 → 生成标签 → 出图'],
-         ['inject', '② 注入', '工作台直接注入规则到酒馆，不用你复制粘贴'],
+        [['auto', '① 自动', 'AI 回复出来 → 文本 AI 读正文规划 → 出图'],
+         ['inject', '② 注入', 'AI 写正文时顺手写 tag → 插件直接抓 tag 出图（不调文本 AI）'],
          ['manual', '③ 手动', '点悬浮球「当前正文生图」才出图']].forEach(function (m) {
             var o = el('div', 'naw-mode-opt' + (settings.mode === m[0] ? ' on' : ''));
             o.innerHTML = '<div class="naw-mo-head"><span class="naw-radio"></span>' + m[1] + '</div><div class="naw-mini-desc">' + m[2] + '</div>';
@@ -2335,13 +2711,18 @@
                 settings.mode = m[0]; saveSettings();
                 modeBox.querySelectorAll('.naw-mode-opt').forEach(function (x) { x.classList.remove('on'); });
                 o.classList.add('on');
-                if (m[0] === 'inject') showInjectPrompt();   // ★ 直接注入，不再复制
-                else clearInjectPrompt();                    // ★ 切走就撤销，不污染别的模式
+                if (m[0] === 'inject') { showInjectPrompt(); renderInjectTrigger(); }   // ★ 直接注入 + 显示 A/B 开关
+                else { clearInjectPrompt(); renderInjectTrigger(); }                    // ★ 切走就撤销，不污染别的模式
             };
             modeBox.appendChild(o);
         });
         c2.appendChild(modeBox);
+        // ★ 注入模式的出图触发方式 A/B（默认 A 按钮）
+        var trigWrap = el('div', 'naw-inject-trigger');
+        trigWrap.id = 'naw-inject-trigger';
+        c2.appendChild(trigWrap);
         p.appendChild(c2);
+        renderInjectTrigger();
 
         // ④ 接口与端点（放最后）：官方 / 第三方 两个预设点选即可，key 已存绝不覆盖
         var apiHead = el('div', 'naw-subhead', '接口与端点' + help('官方 NAI / 第三方 NAI 两个选项：官方自动填好地址；第三方地址留空，由你自己填（不预设任何地址）。密钥已存在本机，不进源码、不上传。'));
@@ -2705,6 +3086,12 @@
     function showInjectPrompt() {
         var text = String(settings.tagInstruction || '').trim();
         if (!text) { toast('注入规则为空，请先在提示词 tab 填「注入指令」'); return; }
+        // ★ 把「本楼层生图数量」写进注入指令（主人 2026-11-24 要求：生几张按设置来）
+        var n = Math.max(1, Math.min(9, parseInt(settings.count, 10) || 3));
+        text = text.replace(/___COUNT___/g, String(n));
+        if (text.indexOf('___COUNT___') < 0) {
+            text += '\n\n本次请恰好写 ' + n + ' 段 <naw_tag> 画面标签，对应 ' + n + ' 个不同瞬间。';
+        }
         var fn = getSetExtensionPrompt();
         if (!fn) {
             // 极端情况：客户端没暴露注入 API，退回复制并明确告知
@@ -2716,7 +3103,7 @@
             // 1=IN_PROMPT（进提示词），depth 0，scan=false，role 0=system
             var r = fn(INJECT_ID, text, 1, 0, false, 0, null);
             if (r && typeof r.catch === 'function') r.catch(function (e) { toast('注入失败：' + (e && e.message ? e.message : e)); return; });
-            toast('已直接注入到酒馆：AI 出正文时会写出 <liwe> 和 <role> 标签');
+            toast('已注入：AI 写正文时会顺手写 <naw_tag> 和 <role>，插件直接抓 tag 出图（不调文本 AI）');
         } catch (e) {
             toast('注入失败：' + (e && e.message ? e.message : e));
         }
@@ -2742,6 +3129,9 @@
             [300, 800, 1600].forEach(function (ms) { setTimeout(hydrateAll, ms); });
             if (settings.mode === 'auto') {
                 setTimeout(function () { runGenerate({ floor: lastAiIndex() }); }, 300);
+            } else if (settings.mode === 'inject') {
+                // ★ 注入模式：不调文本 AI，只抓正文里的 <naw_tag> 转成按钮/直出
+                setTimeout(function () { captureInjectTags(lastAiIndex()); }, 400);
             }
         };
         // 两个事件名都挂：不同版本酒馆用不同的那个，重复挂也无妨（渲染/出图有 generating 锁）
@@ -2864,6 +3254,7 @@
         healRoleScope();
         buildUI();
         ensureImageTagRegex();   // 注册图片标签正则（显示占位 + 提示词隐藏）
+        syncTagFilterRegex();    // ★ 注册正文标签过滤正则（promptOnly，不改显示）
         healHalfWrittenMessages(); // ★ 修复旧版只写 swipes 的半写入，让已写的 tag/图立刻显示
         bindInlineRegen();         // ★ 正文图右下角「重新生成」按钮点击委托
         hookEvents();
