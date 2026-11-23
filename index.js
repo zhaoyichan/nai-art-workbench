@@ -17,7 +17,7 @@
         tag 只存 <naw_plan>（隐藏数据，给插件读）：失败/重启都在。★ 点「正文生图」永远先走文本 AI 重新规划，不跳过。
      ⑤ 配置 = 生图端点（官方/第三方两个选项）+ 独立的「文本 AI 端点」：
         生图官方预填地址、第三方留空由使用者自己填；文本 AI 单独填 OpenAI 兼容
-        地址/key（小波这类只出图的中转没有聊天模型）。三组配置都只在本机存，
+        地址/key（有的中转只出图、没有聊天模型）。三组配置都只在本机存，
         不进源码、不上传，绝不覆盖已填值。
      ⑥ 日志 tab 顶部有「tag 注入演示」：把当前 tag 真正写进正文楼层并立刻重绘显示出来
         （只写 tag、不调生图/不烧额度，用来验证 tag 能不能注入正文）。
@@ -697,6 +697,33 @@
         return base + '/ai/' + seg;
     }
 
+    // ★ 接口超时保护：只中断真正卡死的请求，正常慢出图不受影响。
+    //   mode='buffer' 读 arrayBuffer（生图 zip），否则读 text（文本 AI / 模型列表）。
+    //   连响应体读取一起纳入超时，避免"头回来了、内容卡住"的假活死。
+    async function fetchWithTimeout(url, opts, ms, mode) {
+        var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        var o = {};
+        if (opts) Object.keys(opts).forEach(function (k) { o[k] = opts[k]; });
+        var timer = null;
+        if (ctrl) {
+            o.signal = ctrl.signal;
+            timer = setTimeout(function () { ctrl.abort(); }, ms || 180000);
+        }
+        try {
+            var res = await fetch(url, o);
+            var payload = mode === 'buffer' ? await res.arrayBuffer() : await res.text();
+            return { res: res, payload: payload };
+        } catch (e) {
+            var isAbort = e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')));
+            if (isAbort) {
+                throw new Error('接口超时（' + Math.round((ms || 180000) / 1000) + ' 秒无响应），请检查接口地址或稍后重试');
+            }
+            throw e;
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    }
+
     // 文本生成：跟随酒馆 generateRaw，或自填 OpenAI 兼容接口；要求 AI 返回三瞬间 JSON
     // system = fixedContract（数量规则已替换），user = 切成 P 段的完整正文
     async function genTags(segments, rawForRole) {
@@ -735,8 +762,8 @@
         var headers = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + textKey };
         var body = { model: settings.txtModel, messages: messages, temperature: 0.7 };
         logReq('【文本AI】请求·读正文规划', url, body, null, true);
-        var res = await fetch(url, { method: 'POST', headers: headers, body: JSON.stringify(body) });
-        var rawText = await res.text();
+        var fr = await fetchWithTimeout(url, { method: 'POST', headers: headers, body: JSON.stringify(body) }, 180000);
+        var res = fr.res, rawText = fr.payload;
         if (!res.ok) {
             var tmsg = rawText; try { var te = JSON.parse(rawText); if (te.error && te.error.message) tmsg = te.error.message; } catch (e) {}
             logReq('【文本AI】失败·HTTP ' + res.status, url, body, 'HTTP ' + res.status + ' ' + tmsg, false);
@@ -761,8 +788,8 @@
         if (/\/v1$/.test(tb)) tb = tb.slice(0, -3);
         var url = tb + '/v1/models';
         logReq('【文本AI】模型列表·请求', url, { headers: { Authorization: 'Bearer ' + textKey } }, null, true);
-        var res = await fetch(url, { method: 'GET', headers: { Authorization: 'Bearer ' + textKey } });
-        var txt = await res.text();
+        var fr = await fetchWithTimeout(url, { method: 'GET', headers: { Authorization: 'Bearer ' + textKey } }, 30000);
+        var res = fr.res, txt = fr.payload;
         if (!res.ok) { logReq('【文本AI】模型列表·错误', url, null, 'HTTP ' + res.status + ' ' + txt.slice(0, 300), false); throw new Error('拉取模型 HTTP ' + res.status + ' ' + txt.slice(0, 120)); }
         var data; try { data = JSON.parse(txt); } catch (e) { throw new Error('模型列表不是 JSON'); }
         var list = (data && Array.isArray(data.data)) ? data.data.map(function (x) { return x.id; }).filter(Boolean) : [];
@@ -874,9 +901,11 @@
         }
         var body = { input: positive, model: model, action: 'generate', parameters: params, use_new_shared_trial: true };
         logReq('【生图AI·NAI原生】请求·model=' + model, url, body, null, true);
-        var r = await fetch(url, { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
+        // 生图最慢，给 5 分钟；成功=zip 二进制，失败=JSON 文本，分别处理
+        var fr = await fetchWithTimeout(url, { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) }, 300000, 'buffer');
+        var r = fr.res;
         if (!r.ok) {
-            var rt = await r.text();
+            var rt = ''; try { rt = new TextDecoder().decode(fr.payload); } catch (e3) {}
             var imsg = rt;
             try { var ej = JSON.parse(rt); if (ej.error && ej.error.message) imsg = ej.error.message; else if (ej.message) imsg = ej.message; } catch (e2) {}
             logReq('【生图AI·NAI原生】失败·HTTP ' + r.status + ' · ' + imsg, url, body, 'HTTP ' + r.status + ' ' + rt, false);
@@ -886,7 +915,7 @@
             if (r.status === 429) throw new Error('生图请求过于频繁（429），稍后再试');
             throw new Error('生图 HTTP ' + r.status + '：' + imsg);
         }
-        var buf = await r.arrayBuffer();
+        var buf = fr.payload;
         var dataUrl = unzipNaiImage(buf);
         logReq('【生图AI·NAI原生】返回·成功', url, null, { ok: true, seed: seed, size: size, wh: res.w + 'x' + res.h, model: model, positive: positive, negative: negative }, true);
         return { dataUrl: dataUrl, seed: seed };
@@ -2160,8 +2189,9 @@
     function modalClose() { var m = byId('naw-modal'); if (m) m.classList.remove('on'); }
 
     /* ── 设置 tab（按主人要求重排）──
-       顺序：① 出图开关(追踪/发送方式/本楼层数量/破甲) → ② 出图模式 → ③ 配置方案 → ④ 接口与模型
-       主人原话：逐步发送/一次性发送放在出图模式上面；上面是配置，下面才是接口和模型。 */
+       实际顺序（见下方 order 数组）：配置迁移(最上) → 接口方案 → 接口与端点 → 当前模型
+                                    → 出图模式 → 出图开关 → 出图参数
+       注：逐步发送/一次性发送在「出图模式」区块内；接口与模型在上方，出图参数在最后。 */
     /* ★ 配置迁移：导出=把全部设置打包成 json 下载；导入=读文件覆盖本机设置 */
     function exportConfig() {
         var payload = { __app: 'nai-art-workbench', __ver: 1, exportedAt: Date.now(), settings: {} };
@@ -2604,7 +2634,7 @@
     }
     function saveScheme() {
         if (!Array.isArray(settings.schemes)) settings.schemes = [];
-        var name = prompt('给这套接口方案起个名字（如：小波 / 官方 / 16z）：', '方案 ' + (settings.schemes.length + 1));
+        var name = prompt('给这套接口方案起个名字（如：官方 / 中转A / 自建）：', '方案 ' + (settings.schemes.length + 1));
         if (!name || !name.trim()) return;
         var cfg = {};
         SCHEME_KEYS.forEach(function (k) { cfg[k] = clone(settings[k]); });
